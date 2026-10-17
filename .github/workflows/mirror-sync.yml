@@ -1,0 +1,93 @@
+name: Mirror Sync
+
+on:
+  schedule:
+    - cron: '7 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Sync git refs (branches + tags)
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: J09715/Tianyan
+        run: |
+          set -euo pipefail
+          SELF_URL="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git clone --bare --quiet "$SELF_URL" mirror.git
+          cd mirror.git
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --quiet --force --prune upstream '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+          git fetch --quiet --force origin '+refs/heads/_mirror:refs/heads/_mirror'
+          git rev-parse --verify --quiet refs/heads/_mirror >/dev/null || { echo "ERROR: control branch missing, aborting without push"; exit 1; }
+          while IFS= read -r r; do git update-ref -d "$r"; done < <(git for-each-ref --format='%(refname)' refs/remotes)
+          git ls-remote --tags --refs upstream | sed 's#.*refs/tags/##' | sort > /tmp/up-tags.txt
+          git for-each-ref --format='%(refname:strip=2)' refs/tags | sort > /tmp/lo-tags.txt
+          comm -23 /tmp/lo-tags.txt /tmp/up-tags.txt > /tmp/stale-tags.txt || true
+          while IFS= read -r t; do if [ -n "$t" ]; then git tag -d "$t"; fi; done < /tmp/stale-tags.txt
+          git push --quiet --mirror "$SELF_URL"
+          echo "git mirror OK: $(git for-each-ref --format='%(refname)' refs/heads | wc -l) branches, $(git for-each-ref --format='%(refname)' refs/tags | wc -l) tags"
+      - name: Sync releases (metadata + binary assets)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: J09715/Tianyan
+        run: |
+          set -euo pipefail
+          gh api "repos/${UPSTREAM}/releases?per_page=100" --paginate --slurp > /tmp/rels.json
+          # 1) create missing releases (oldest first so Latest resolves correctly)
+          jq -r '[.[][]] | sort_by(.created_at)[] | @base64' /tmp/rels.json | while IFS= read -r b64; do
+            rel=$(printf '%s' "$b64" | base64 -d)
+            tag=$(printf '%s' "$rel" | jq -r '.tag_name')
+            if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then continue; fi
+            printf '%s' "$rel" | jq -r '.body // ""' > /tmp/notes.md
+            name=$(printf '%s' "$rel" | jq -r '.name // ""')
+            args=(release create "$tag" -R "$GITHUB_REPOSITORY" --notes-file /tmp/notes.md --verify-tag)
+            if [ -n "$name" ]; then args+=(--title "$name"); fi
+            if [ "$(printf '%s' "$rel" | jq -r '.prerelease')" = "true" ]; then args+=(--prerelease); fi
+            gh "${args[@]}"
+            echo "created release $tag"
+          done
+          # 2) asset sync: for every upstream release ensure the mirror has an identical asset name+size set
+          jq -r '[.[][]] | sort_by(.created_at)[] | @base64' /tmp/rels.json | while IFS= read -r b64; do
+            rel=$(printf '%s' "$b64" | base64 -d)
+            tag=$(printf '%s' "$rel" | jq -r '.tag_name')
+            want=$(printf '%s' "$rel" | jq -r '.assets[] | "\(.name)\t\(.size)"' | sort || true)
+            if [ -z "$want" ]; then continue; fi
+            have=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.assets[] | "\(.name)\t\(.size)"' 2>/dev/null | sort || true)
+            if [ "$want" = "$have" ]; then continue; fi
+            echo "assets drift on $tag, syncing..."
+            d="/tmp/assets/$tag"
+            mkdir -p "$d"
+            for attempt in 1 2 3; do
+              gh release download "$tag" -R "$UPSTREAM" -D "$d" --clobber
+              bad=0
+              while IFS=$'\t' read -r n s; do
+                actual=$(stat -c %s "$d/$n" 2>/dev/null || echo 0)
+                if [ "$actual" != "$s" ]; then bad=1; echo "  size mismatch: $n local=$actual want=$s"; fi
+              done <<< "$want"
+              if [ "$bad" = "0" ]; then break; fi
+              echo "  re-downloading (attempt $attempt)"
+            done
+            files=("$d"/*)
+            if [ -e "${files[0]}" ]; then
+              gh release upload "$tag" -R "$GITHUB_REPOSITORY" "${files[@]}" --clobber
+            fi
+            newhave=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.assets[] | "\(.name)\t\(.size)"' | sort || true)
+            if [ "$want" = "$newhave" ]; then echo "assets verified: $tag"; else echo "WARN: asset verification mismatch after upload: $tag"; fi
+          done
+          # 3) align Latest flag with upstream (best effort)
+          latest=$(gh api "repos/${UPSTREAM}/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+          if [ -n "$latest" ] && gh release view "$latest" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$latest" -R "$GITHUB_REPOSITORY" --latest
+          fi
+          echo "release sync OK"
